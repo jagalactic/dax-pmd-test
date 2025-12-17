@@ -1,0 +1,93 @@
+Subject: [PATCH] mm/memremap: fix spurious large folio warning for FS-DAX
+
+This patch addresses a warning that I discovered while working on famfs,
+which is an fs-dax file system that virtually always does PMD faults
+(next famfs patch series coming after the holidays).
+
+However, XFS also does PMD faults in fs-dax mode, and it also triggers
+the warning. It takes some effort to get XFS to do a PMD fault, but
+instructions to reproduce it are below.
+
+The VM_WARN_ON_ONCE(folio_test_large(folio)) check in
+free_zone_device_folio() incorrectly triggers for MEMORY_DEVICE_FS_DAX
+when PMD (2MB) mappings are used.
+
+FS-DAX legitimately creates large file-backed folios when handling PMD
+faults. This is a core feature of FS-DAX that provides significant
+performance benefits by mapping 2MB regions directly to persistent
+memory. When these mappings are unmapped, the large folios are freed
+through free_zone_device_folio(), which triggers the spurious warning.
+
+The warning was introduced by commit that added support for large zone
+device private folios. However, that commit did not account for FS-DAX
+file-backed folios, which have always supported large (PMD-sized)
+mappings.
+
+The check distinguishes between anonymous folios (which clear
+AnonExclusive flags for each sub-page) and file-backed folios. For
+file-backed folios, it assumes large folios are unexpected - but this
+assumption is incorrect for FS-DAX.
+
+The fix is to exempt MEMORY_DEVICE_FS_DAX from the large folio warning,
+allowing FS-DAX to continue using PMD mappings without triggering false
+warnings.
+
+=== How to reproduce ===
+
+A reproducer is available at:
+
+    git clone <REPO_URL>
+    cd xfs-dax-test
+    make
+    sudo make test
+
+This will set up XFS on pmem with 2MB stripe alignment and run a test
+that triggers the warning.
+
+Alternatively, follow the manual steps below.
+
+Prerequisites:
+  - Linux kernel with FS-DAX support and CONFIG_DEBUG_VM=y
+  - A pmem device (real or emulated)
+  - An fsdax namespace configured via ndctl as /dev/pmem0
+
+Manual steps:
+
+1. Create an fsdax namespace (if not already present):
+   # ndctl create-namespace -m fsdax -e namespace0.0
+
+2. Create XFS with 2MB stripe alignment:
+   # mkfs.xfs -f -d su=2m,sw=1 /dev/pmem0
+   # mount -o dax /dev/pmem0 /mnt/pmem
+
+3. Compile and run the reproducer:
+   # gcc -Wall -O2 -o dax_pmd_test dax_pmd_test.c
+   # ./dax_pmd_test /mnt/pmem/testfile
+
+4. Check dmesg for the warning:
+   WARNING: mm/memremap.c:431 at free_zone_device_folio+0x.../0x...
+
+Note: The 2MB stripe alignment (-d su=2m,sw=1) is critical. XFS normally
+allocates blocks at arbitrary offsets, causing PMD faults to fall back
+to PTE faults. The stripe alignment forces 2MB-aligned allocations,
+allowing PMD faults to succeed and exposing this bug.
+
+=== Proposed fix ===
+
+--- a/mm/memremap.c
++++ b/mm/memremap.c
+@@ -427,7 +427,12 @@ void free_zone_device_folio(struct folio *folio)
+ 	if (folio_test_anon(folio)) {
+ 		for (i = 0; i < nr; i++)
+ 			__ClearPageAnonExclusive(folio_page(folio, i));
+ 	} else {
+-		VM_WARN_ON_ONCE(folio_test_large(folio));
++		/*
++		 * FS-DAX legitimately uses large file-backed folios for PMD
++		 * mappings, so only warn for other device types.
++		 */
++		VM_WARN_ON_ONCE(pgmap->type != MEMORY_DEVICE_FS_DAX &&
++				folio_test_large(folio));
+ 	}
+
+Signed-off-by:
