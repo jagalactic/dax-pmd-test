@@ -76,15 +76,22 @@ WARNING: mm/memremap.c:431 at free_zone_device_folio+0x.../0x...
 
 The fix is to exempt `MEMORY_DEVICE_FS_DAX` from the large folio warning:
 
-```c
-} else {
-    /*
-     * FS-DAX legitimately uses large file-backed folios for PMD
-     * mappings, so only warn for other device types.
-     */
-    VM_WARN_ON_ONCE(pgmap->type != MEMORY_DEVICE_FS_DAX &&
-            folio_test_large(folio));
-}
+```diff
+--- a/mm/memremap.c
++++ b/mm/memremap.c
+@@ -427,7 +427,12 @@ void free_zone_device_folio(struct folio *folio)
+ 	if (folio_test_anon(folio)) {
+ 		for (i = 0; i < nr; i++)
+ 			__ClearPageAnonExclusive(folio_page(folio, i));
+ 	} else {
+-		VM_WARN_ON_ONCE(folio_test_large(folio));
++		/*
++		 * FS-DAX legitimately uses large file-backed folios for PMD
++		 * mappings, so only warn for other device types.
++		 */
++		VM_WARN_ON_ONCE(pgmap->type != MEMORY_DEVICE_FS_DAX &&
++				folio_test_large(folio));
+ 	}
 ```
 
 ## License
